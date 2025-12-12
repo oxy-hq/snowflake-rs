@@ -1,7 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::lock::Mutex;
 #[cfg(feature = "cert-auth")]
@@ -18,6 +19,7 @@ use crate::requests::{
 #[cfg(feature = "cert-auth")]
 use crate::requests::{CertLoginRequest, CertRequestData};
 use crate::responses::AuthResponse;
+use crate::token_cache::{CachedToken, TokenCache, TokenCacheEntry, TokenCacheError};
 
 #[derive(Error, Debug)]
 pub enum AuthError {
@@ -62,6 +64,9 @@ pub enum AuthError {
 
     #[error("Failed to open browser: {0}")]
     BrowserOpenError(String),
+
+    #[error("Token cache error: {0}")]
+    TokenCacheError(#[from] TokenCacheError),
 }
 
 #[derive(Debug)]
@@ -70,6 +75,25 @@ struct AuthTokens {
     master_token: AuthToken,
     /// expected by snowflake api for all requests within session to follow sequence id
     sequence_id: u64,
+}
+
+impl AuthTokens {
+    /// Convert to a cache entry for filesystem storage
+    fn to_cache_entry(&self) -> TokenCacheEntry {
+        TokenCacheEntry {
+            session_token: self.session_token.to_cached_token(),
+            master_token: self.master_token.to_cached_token(),
+        }
+    }
+
+    /// Create from a cache entry
+    fn from_cache_entry(entry: TokenCacheEntry) -> Self {
+        Self {
+            session_token: AuthToken::from_cached_token(entry.session_token),
+            master_token: AuthToken::from_cached_token(entry.master_token),
+            sequence_id: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +136,41 @@ impl AuthToken {
     pub fn auth_header(&self) -> String {
         format!("Snowflake Token=\"{}\"", &self.token)
     }
+
+    /// Convert to a cached token for filesystem storage
+    fn to_cached_token(&self) -> CachedToken {
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(self.issued_on.elapsed().as_secs());
+
+        CachedToken {
+            token: self.token.clone(),
+            issued_at,
+            valid_for_seconds: self.valid_for.as_secs(),
+        }
+    }
+
+    /// Create from a cached token
+    fn from_cached_token(cached: CachedToken) -> Self {
+        let now_system = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let elapsed = now_system.saturating_sub(cached.issued_at);
+        let elapsed_duration = Duration::from_secs(elapsed);
+
+        Self {
+            token: cached.token,
+            valid_for: Duration::from_secs(cached.valid_for_seconds),
+            // Reconstruct the issued_on time by subtracting elapsed time from now
+            issued_on: Instant::now()
+                .checked_sub(elapsed_duration)
+                .unwrap_or_else(Instant::now),
+        }
+    }
 }
 
 enum AuthType {
@@ -142,6 +201,21 @@ pub struct Session {
     #[allow(dead_code)]
     private_key_pem: Option<String>,
     password: Option<String>,
+
+    /// Timeout for external browser authentication (in seconds)
+    /// Default: 300 seconds (5 minutes)
+    browser_auth_timeout_secs: u64,
+
+    /// Enable filesystem token caching for external browser authentication
+    /// Default: false (disabled for security)
+    /// When enabled, tokens are cached in ~/.cache/snowflake/ (or SF_TEMPORARY_CREDENTIAL_CACHE_DIR)
+    enable_token_cache: bool,
+
+    /// Custom directory for token cache (if None, uses default)
+    cache_directory: Option<PathBuf>,
+
+    /// Token cache instance (created on-demand)
+    token_cache: Option<TokenCache>,
 }
 
 // todo: make builder
@@ -181,6 +255,10 @@ impl Session {
             role,
             schema,
             password: None,
+            browser_auth_timeout_secs: 300,
+            enable_token_cache: false,
+            cache_directory: None,
+            token_cache: None,
         }
     }
 
@@ -218,6 +296,10 @@ impl Session {
             password,
             schema,
             private_key_pem: None,
+            browser_auth_timeout_secs: 300,
+            enable_token_cache: false,
+            cache_directory: None,
+            token_cache: None,
         }
     }
 
@@ -233,6 +315,87 @@ impl Session {
         username: &str,
         role: Option<&str>,
     ) -> Self {
+        Self::externalbrowser_auth_with_timeout(
+            connection,
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
+            300,
+        )
+    }
+
+    /// Authenticate using external browser (SSO) with custom timeout and optional token caching
+    // fixme: add builder or introduce structs
+    #[allow(clippy::too_many_arguments)]
+    pub fn externalbrowser_auth_with_timeout(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        browser_auth_timeout_secs: u64,
+    ) -> Self {
+        Self::externalbrowser_auth_with_options(
+            connection,
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
+            browser_auth_timeout_secs,
+            false,
+        )
+    }
+
+    /// Authenticate using external browser (SSO) with full options
+    // fixme: add builder or introduce structs
+    #[allow(clippy::too_many_arguments)]
+    pub fn externalbrowser_auth_with_options(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        browser_auth_timeout_secs: u64,
+        enable_token_cache: bool,
+    ) -> Self {
+        Self::externalbrowser_auth_full(
+            connection,
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
+            browser_auth_timeout_secs,
+            enable_token_cache,
+            None,
+        )
+    }
+
+    /// Authenticate using external browser (SSO) with full options including custom cache directory
+    // fixme: add builder or introduce structs
+    #[allow(clippy::too_many_arguments)]
+    pub fn externalbrowser_auth_full(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        browser_auth_timeout_secs: u64,
+        enable_token_cache: bool,
+        cache_directory: Option<PathBuf>,
+    ) -> Self {
         let account_identifier = account_identifier.to_uppercase();
 
         let database = database.map(str::to_uppercase);
@@ -240,6 +403,28 @@ impl Session {
 
         let username = username.to_uppercase();
         let role = role.map(str::to_uppercase);
+
+        // Create token cache if enabled
+        let token_cache = if enable_token_cache {
+            let cache_result = if let Some(ref dir) = cache_directory {
+                TokenCache::with_directory(dir)
+            } else {
+                TokenCache::new()
+            };
+
+            match cache_result {
+                Ok(cache) => {
+                    log::info!("Token caching enabled");
+                    Some(cache)
+                }
+                Err(e) => {
+                    log::warn!("Failed to create token cache, caching disabled: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             connection,
@@ -253,7 +438,72 @@ impl Session {
             password: None,
             schema,
             private_key_pem: None,
+            browser_auth_timeout_secs,
+            enable_token_cache,
+            cache_directory,
+            token_cache,
         }
+    }
+
+    /// Clear cached tokens from filesystem
+    fn clear_token_cache(&self) {
+        if let Some(ref cache) = self.token_cache {
+            if let Err(e) = cache.remove(&self.account_identifier, &self.username) {
+                log::warn!("Failed to remove cached tokens: {}", e);
+            } else {
+                log::debug!("Cleared cached tokens due to invalidation");
+            }
+        }
+    }
+
+    /// Invalidate cached tokens. Call this if authentication fails with cached tokens.
+    /// This removes the cached tokens from the filesystem and clears in-memory tokens.
+    pub async fn invalidate_cache(&mut self) {
+        log::info!("Invalidating cached tokens");
+        self.clear_token_cache();
+        *self.auth_tokens.lock().await = None;
+    }
+
+    /// Explicitly trigger authentication flow.
+    /// This is useful for pre-configuring authentication in settings pages or verifying credentials
+    /// before executing queries. For external browser auth, this will open the browser immediately.
+    ///
+    /// # Returns
+    /// - `Ok(())` if authentication succeeded
+    /// - `Err(AuthError)` if authentication failed
+    ///
+    /// # Example
+    /// ```no_run
+    /// use snowflake_api::{SnowflakeApi, AuthArgs, AuthType, SnowflakeApiBuilder};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let auth = AuthArgs {
+    ///     account_identifier: "account".to_string(),
+    ///     username: "user".to_string(),
+    ///     auth_type: AuthType::ExternalBrowser,
+    ///     warehouse: None,
+    ///     database: None,
+    ///     schema: None,
+    ///     role: None,
+    /// };
+    ///
+    /// let mut api = SnowflakeApiBuilder::new(auth)
+    ///     .with_token_cache(true)
+    ///     .build()?;
+    ///
+    /// // Trigger authentication immediately (e.g., in settings page)
+    /// api.authenticate().await?;
+    ///
+    /// // Now authenticated and ready to execute queries
+    /// let result = api.exec("SELECT 1").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn authenticate(&self) -> Result<(), AuthError> {
+        // Trigger get_token which will handle authentication if needed
+        self.get_token().await?;
+        log::info!("Authentication completed successfully");
+        Ok(())
     }
 
     /// Get cached token or request a new one if old one has expired.
@@ -264,34 +514,122 @@ impl Session {
                 .as_ref()
                 .is_some_and(|at| at.master_token.is_expired())
         {
-            // Create new session if tokens are absent or can not be exchange
-            let tokens = match self.auth_type {
-                AuthType::Certificate => {
-                    log::info!("Starting session with certificate authentication");
-                    if cfg!(feature = "cert-auth") {
-                        self.create(self.cert_request_body()?).await
-                    } else {
-                        Err(AuthError::MissingCertificate)?
+            // Try to load from filesystem cache first (only for external browser auth)
+            let mut tokens_loaded_from_cache = false;
+            if matches!(self.auth_type, AuthType::ExternalBrowser) && self.token_cache.is_some() {
+                if let Some(ref cache) = self.token_cache {
+                    match cache.load(&self.account_identifier, &self.username) {
+                        Ok(Some(entry)) => {
+                            log::info!("Loaded valid tokens from filesystem cache");
+                            *auth_tokens = Some(AuthTokens::from_cache_entry(entry));
+                            tokens_loaded_from_cache = true;
+                        }
+                        Ok(None) => {
+                            log::debug!("No cached tokens found in filesystem");
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load tokens from cache: {}", e);
+                        }
                     }
                 }
-                AuthType::Password => {
-                    log::info!("Starting session with password authentication");
-                    self.create(self.passwd_request_body()?).await
+            }
+
+            // If we didn't load from cache, create new session
+            if !tokens_loaded_from_cache {
+                let tokens = match self.auth_type {
+                    AuthType::Certificate => {
+                        log::info!("Starting session with certificate authentication");
+                        if cfg!(feature = "cert-auth") {
+                            self.create(self.cert_request_body()?).await
+                        } else {
+                            Err(AuthError::MissingCertificate)?
+                        }
+                    }
+                    AuthType::Password => {
+                        log::info!("Starting session with password authentication");
+                        self.create(self.passwd_request_body()?).await
+                    }
+                    AuthType::ExternalBrowser => {
+                        log::info!("Starting session with external browser authentication");
+                        self.authenticate_with_browser().await
+                    }
+                }?;
+
+                // Save to cache if external browser auth and caching is enabled
+                if matches!(self.auth_type, AuthType::ExternalBrowser) {
+                    if let Some(ref cache) = self.token_cache {
+                        let cache_entry = tokens.to_cache_entry();
+                        if let Err(e) =
+                            cache.save(&self.account_identifier, &self.username, &cache_entry)
+                        {
+                            log::warn!("Failed to save tokens to cache: {}", e);
+                        }
+                    }
                 }
-                AuthType::ExternalBrowser => {
-                    log::info!("Starting session with external browser authentication");
-                    self.authenticate_with_browser().await
-                }
-            }?;
-            *auth_tokens = Some(tokens);
+
+                *auth_tokens = Some(tokens);
+            }
         } else if auth_tokens
             .as_ref()
             .is_some_and(|at| at.session_token.is_expired())
         {
             // Renew old session token
             let old_token = auth_tokens.take().unwrap();
-            let tokens = self.renew(old_token).await?;
-            *auth_tokens = Some(tokens);
+
+            match self.renew(old_token).await {
+                Ok(tokens) => {
+                    // Update cache after renewal if external browser auth and caching is enabled
+                    if matches!(self.auth_type, AuthType::ExternalBrowser) {
+                        if let Some(ref cache) = self.token_cache {
+                            let cache_entry = tokens.to_cache_entry();
+                            if let Err(e) =
+                                cache.save(&self.account_identifier, &self.username, &cache_entry)
+                            {
+                                log::warn!("Failed to update cached tokens: {}", e);
+                            }
+                        }
+                    }
+                    *auth_tokens = Some(tokens);
+                }
+                Err(e) => {
+                    // If renewal failed, the cached token might be invalid (revoked, corrupted, etc.)
+                    // For external browser auth, clear the cache and re-trigger authentication
+                    if matches!(self.auth_type, AuthType::ExternalBrowser) {
+                        log::warn!(
+                            "Token renewal failed ({}), clearing cache and re-authenticating",
+                            e
+                        );
+                        self.clear_token_cache();
+
+                        // Re-trigger browser authentication
+                        match self.authenticate_with_browser().await {
+                            Ok(new_tokens) => {
+                                // Save new tokens to cache
+                                if let Some(ref cache) = self.token_cache {
+                                    let cache_entry = new_tokens.to_cache_entry();
+                                    if let Err(cache_err) = cache.save(
+                                        &self.account_identifier,
+                                        &self.username,
+                                        &cache_entry,
+                                    ) {
+                                        log::warn!(
+                                            "Failed to save new tokens to cache: {}",
+                                            cache_err
+                                        );
+                                    }
+                                }
+                                *auth_tokens = Some(new_tokens);
+                            }
+                            Err(auth_err) => {
+                                log::error!("Re-authentication failed: {}", auth_err);
+                                return Err(auth_err);
+                            }
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         }
         auth_tokens.as_mut().unwrap().sequence_id += 1;
         Ok(AuthParts {
@@ -303,6 +641,13 @@ impl Session {
     pub async fn close(&mut self) -> Result<(), AuthError> {
         if let Some(tokens) = self.auth_tokens.lock().await.take() {
             log::debug!("Closing sessions");
+
+            // Remove cached tokens when closing session
+            if let Some(ref cache) = self.token_cache {
+                if let Err(e) = cache.remove(&self.account_identifier, &self.username) {
+                    log::warn!("Failed to remove cached tokens: {}", e);
+                }
+            }
 
             let resp = self
                 .connection
@@ -485,8 +830,12 @@ impl Session {
         log::info!("Opening browser for authentication: {}", sso_url);
         webbrowser::open(&sso_url).map_err(|e| AuthError::BrowserOpenError(e.to_string()))?;
 
-        // Wait for the browser to redirect back with the token (5 minute timeout)
-        let timeout = Duration::from_secs(300);
+        // Wait for the browser to redirect back with the token
+        let timeout = Duration::from_secs(self.browser_auth_timeout_secs);
+        log::debug!(
+            "Waiting for browser callback with timeout of {} seconds",
+            self.browser_auth_timeout_secs
+        );
         let token = Self::receive_saml_token(listener, timeout)?;
         log::debug!("Received SAML token from browser callback");
 
@@ -513,31 +862,50 @@ impl Session {
             .map_err(|e| AuthError::LocalServerError(e.to_string()))?
             .port();
 
-        // Set read timeout for the listener
-        listener
-            .set_nonblocking(false)
-            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
-
         Ok((listener, port))
     }
 
     /// Wait for the browser callback with the SAML token
     fn receive_saml_token(listener: TcpListener, timeout: Duration) -> Result<String, AuthError> {
-        log::debug!("Waiting for browser callback...");
+        log::debug!(
+            "Waiting for browser callback with timeout of {} seconds...",
+            timeout.as_secs()
+        );
 
-        let (mut stream, _) = listener.accept().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut
-            {
-                AuthError::BrowserAuthTimeout
-            } else {
-                AuthError::LocalServerError(e.to_string())
+        // Set listener to non-blocking mode so we can implement timeout
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        let start_time = Instant::now();
+
+        // Poll for incoming connection with timeout
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(conn) => break conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Check if we've exceeded timeout
+                    if start_time.elapsed() >= timeout {
+                        log::warn!(
+                            "Browser authentication timed out after {} seconds",
+                            timeout.as_secs()
+                        );
+                        return Err(AuthError::BrowserAuthTimeout);
+                    }
+                    // Sleep briefly before trying again to avoid busy-waiting
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(AuthError::LocalServerError(e.to_string()));
+                }
             }
-        })?;
+        };
 
-        // Set timeout on the stream
+        log::debug!("Browser callback received");
+
+        // Set timeout on the stream for reading the request
         stream
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
 
         let buf_reader = BufReader::new(&stream);
