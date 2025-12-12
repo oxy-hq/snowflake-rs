@@ -1,5 +1,7 @@
 extern crate snowflake_api;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
@@ -36,6 +38,15 @@ struct Args {
     /// sql statement to execute and print result from
     #[arg(long)]
     sql: String,
+
+    #[arg(long)]
+    browser_timeout_secs: Option<u64>,
+
+    #[arg(long)]
+    enable_token_cache: Option<bool>,
+
+    #[arg(long)]
+    cache_directory: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -47,15 +58,19 @@ async fn main() -> Result<()> {
     println!("Initiating external browser authentication...");
     println!("A browser window will open for you to authenticate.");
 
-    let mut api = SnowflakeApi::with_externalbrowser_auth(
+    let mut api = SnowflakeApi::with_externalbrowser_auth_full(
         &args.account_identifier,
         args.warehouse.as_deref(),
         args.database.as_deref(),
         args.schema.as_deref(),
         &args.username,
         args.role.as_deref(),
+        args.browser_timeout_secs.unwrap_or(30),
+        args.enable_token_cache.unwrap_or(true),
+        args.cache_directory,
     )?;
-
+    println!("Authenticating...");
+    api.authenticate().await?;
     println!("Executing query...");
     let res = api.exec(&args.sql).await?;
 

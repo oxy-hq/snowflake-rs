@@ -15,6 +15,7 @@ clippy::missing_panics_doc
 
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_ipc::reader::StreamReader;
@@ -45,6 +46,7 @@ mod put;
 mod requests;
 mod responses;
 mod session;
+mod token_cache;
 
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
@@ -238,15 +240,49 @@ pub struct CertificateArgs {
 pub struct SnowflakeApiBuilder {
     pub auth: AuthArgs,
     client: Option<ClientWithMiddleware>,
+    /// Enable token caching for external browser authentication (default: false)
+    enable_token_cache: bool,
+    /// Custom cache directory for token storage (default: None, uses platform default)
+    cache_directory: Option<PathBuf>,
+    /// Timeout for external browser authentication in seconds (default: 300)
+    browser_auth_timeout_secs: u64,
 }
 
 impl SnowflakeApiBuilder {
     pub fn new(auth: AuthArgs) -> Self {
-        Self { auth, client: None }
+        Self {
+            auth,
+            client: None,
+            enable_token_cache: false,
+            cache_directory: None,
+            browser_auth_timeout_secs: 300,
+        }
     }
 
     pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Enable token caching for external browser authentication.
+    /// WARNING: Tokens are cached on the filesystem and remain valid for up to 4 hours.
+    /// Only enable this if you understand the security implications.
+    pub fn with_token_cache(mut self, enable: bool) -> Self {
+        self.enable_token_cache = enable;
+        self
+    }
+
+    /// Set a custom cache directory for token storage.
+    /// If not set, uses the platform default (~/.cache/snowflake on Linux/macOS).
+    pub fn with_cache_directory<P: Into<PathBuf>>(mut self, directory: P) -> Self {
+        self.cache_directory = Some(directory.into());
+        self
+    }
+
+    /// Set the timeout for external browser authentication (in seconds).
+    /// Default is 300 seconds (5 minutes).
+    pub fn with_browser_timeout(mut self, timeout_secs: u64) -> Self {
+        self.browser_auth_timeout_secs = timeout_secs;
         self
     }
 
@@ -277,7 +313,7 @@ impl SnowflakeApiBuilder {
                 self.auth.role.as_deref(),
                 &args.private_key_pem,
             ),
-            AuthType::ExternalBrowser => Session::externalbrowser_auth(
+            AuthType::ExternalBrowser => Session::externalbrowser_auth_full(
                 Arc::clone(&connection),
                 &self.auth.account_identifier,
                 self.auth.warehouse.as_deref(),
@@ -285,6 +321,9 @@ impl SnowflakeApiBuilder {
                 self.auth.schema.as_deref(),
                 &self.auth.username,
                 self.auth.role.as_deref(),
+                self.browser_auth_timeout_secs,
+                self.enable_token_cache,
+                self.cache_directory,
             ),
         };
 
@@ -406,6 +445,78 @@ impl SnowflakeApi {
         ))
     }
 
+    /// Initialize object with external browser (SSO) auth with full configuration options.
+    /// This provides complete control over timeout, token caching, and cache directory.
+    ///
+    /// # Parameters
+    /// - `account_identifier`: Snowflake account identifier
+    /// - `warehouse`: Optional warehouse name
+    /// - `database`: Optional database name
+    /// - `schema`: Optional schema name
+    /// - `username`: Snowflake username
+    /// - `role`: Optional role name
+    /// - `browser_auth_timeout_secs`: Browser authentication timeout in seconds (default: 300)
+    /// - `enable_token_cache`: Enable filesystem token caching (default: false, WARNING: security implications)
+    /// - `cache_directory`: Optional custom cache directory (uses platform default if None)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use snowflake_api::SnowflakeApi;
+    /// use std::path::PathBuf;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let api = SnowflakeApi::with_externalbrowser_auth_full(
+    ///     "MY_ACCOUNT",
+    ///     Some("WAREHOUSE"),
+    ///     Some("DATABASE"),
+    ///     Some("SCHEMA"),
+    ///     "username",
+    ///     Some("ROLE"),
+    ///     600,  // 10 minute timeout
+    ///     true,  // enable token caching
+    ///     Some(PathBuf::from("/custom/cache/dir")),  // custom cache directory
+    /// )?;
+    ///
+    /// // Authenticate immediately
+    /// api.authenticate().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_externalbrowser_auth_full(
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        browser_auth_timeout_secs: u64,
+        enable_token_cache: bool,
+        cache_directory: Option<PathBuf>,
+    ) -> Result<Self, SnowflakeApiError> {
+        let connection = Arc::new(Connection::new()?);
+
+        let session = Session::externalbrowser_auth_full(
+            Arc::clone(&connection),
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
+            browser_auth_timeout_secs,
+            enable_token_cache,
+            cache_directory,
+        );
+
+        let account_identifier = account_identifier.to_uppercase();
+        Ok(Self::new(
+            Arc::clone(&connection),
+            session,
+            account_identifier,
+        ))
+    }
+
     pub fn from_env() -> Result<Self, SnowflakeApiError> {
         SnowflakeApiBuilder::new(AuthArgs::from_env()?).build()
     }
@@ -415,6 +526,64 @@ impl SnowflakeApi {
     /// If another request is made the new session will be initiated.
     pub async fn close_session(&mut self) -> Result<(), SnowflakeApiError> {
         self.session.close().await?;
+        Ok(())
+    }
+
+    /// Invalidate cached authentication tokens.
+    /// Call this if you encounter authentication errors and want to force re-authentication.
+    /// This is particularly useful with external browser authentication when cached tokens become invalid.
+    pub async fn invalidate_token_cache(&mut self) {
+        self.session.invalidate_cache().await;
+    }
+
+    /// Explicitly trigger the authentication flow.
+    ///
+    /// This method forces authentication to happen immediately rather than waiting for the first query.
+    /// It's particularly useful for:
+    /// - Pre-configuring authentication in settings/configuration pages
+    /// - Verifying credentials before executing queries
+    /// - Triggering external browser authentication proactively
+    /// - Testing authentication without executing a query
+    ///
+    /// For external browser authentication, this will open the browser immediately and cache
+    /// the token (if caching is enabled), so subsequent operations won't require re-authentication.
+    ///
+    /// # Returns
+    /// - `Ok(())` if authentication succeeded and tokens are cached
+    /// - `Err(SnowflakeApiError)` if authentication failed
+    ///
+    /// # Example
+    /// ```no_run
+    /// use snowflake_api::{AuthArgs, AuthType, SnowflakeApiBuilder};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let auth = AuthArgs {
+    ///     account_identifier: "MY_ACCOUNT".to_string(),
+    ///     username: "my_user".to_string(),
+    ///     auth_type: AuthType::ExternalBrowser,
+    ///     warehouse: Some("WAREHOUSE".to_string()),
+    ///     database: Some("DATABASE".to_string()),
+    ///     schema: Some("SCHEMA".to_string()),
+    ///     role: Some("ROLE".to_string()),
+    /// };
+    ///
+    /// let mut api = SnowflakeApiBuilder::new(auth)
+    ///     .with_token_cache(true)  // Enable token caching
+    ///     .build()?;
+    ///
+    /// // In a settings page: trigger authentication immediately
+    /// match api.authenticate().await {
+    ///     Ok(()) => println!("Authentication successful! Token cached."),
+    ///     Err(e) => println!("Authentication failed: {}", e),
+    /// }
+    ///
+    /// // Later: execute queries without re-authentication
+    /// let result = api.exec("SELECT CURRENT_USER()").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn authenticate(&self) -> Result<(), SnowflakeApiError> {
+        self.session.authenticate().await?;
         Ok(())
     }
 
