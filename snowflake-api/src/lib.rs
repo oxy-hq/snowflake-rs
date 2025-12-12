@@ -221,6 +221,7 @@ impl AuthArgs {
 pub enum AuthType {
     Password(PasswordArgs),
     Certificate(CertificateArgs),
+    ExternalBrowser,
 }
 
 pub struct PasswordArgs {
@@ -273,6 +274,15 @@ impl SnowflakeApiBuilder {
                 &self.auth.username,
                 self.auth.role.as_deref(),
                 &args.private_key_pem,
+            ),
+            AuthType::ExternalBrowser => Session::externalbrowser_auth(
+                Arc::clone(&connection),
+                &self.auth.account_identifier,
+                self.auth.warehouse.as_deref(),
+                self.auth.database.as_deref(),
+                self.auth.schema.as_deref(),
+                &self.auth.username,
+                self.auth.role.as_deref(),
             ),
         };
 
@@ -354,6 +364,36 @@ impl SnowflakeApi {
             username,
             role,
             private_key_pem,
+        );
+
+        let account_identifier = account_identifier.to_uppercase();
+        Ok(Self::new(
+            Arc::clone(&connection),
+            session,
+            account_identifier,
+        ))
+    }
+
+    /// Initialize object with external browser (SSO) auth. Authentication happens on the first request.
+    /// This will open a browser window for the user to authenticate via their SSO provider.
+    pub fn with_externalbrowser_auth(
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+    ) -> Result<Self, SnowflakeApiError> {
+        let connection = Arc::new(Connection::new()?);
+
+        let session = Session::externalbrowser_auth(
+            Arc::clone(&connection),
+            account_identifier,
+            warehouse,
+            database,
+            schema,
+            username,
+            role,
         );
 
         let account_identifier = account_identifier.to_uppercase();
