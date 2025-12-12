@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,12 +10,13 @@ use thiserror::Error;
 
 use crate::connection;
 use crate::connection::{Connection, QueryType};
+use crate::requests::{
+    AuthenticatorRequest, AuthenticatorRequestData, ClientEnvironment, ExternalBrowserLoginRequest,
+    ExternalBrowserRequestData, LoginRequest, LoginRequestCommon, PasswordLoginRequest,
+    PasswordRequestData, RenewSessionRequest, SessionParameters,
+};
 #[cfg(feature = "cert-auth")]
 use crate::requests::{CertLoginRequest, CertRequestData};
-use crate::requests::{
-    ClientEnvironment, LoginRequest, LoginRequestCommon, PasswordLoginRequest, PasswordRequestData,
-    RenewSessionRequest, SessionParameters,
-};
 use crate::responses::AuthResponse;
 
 #[derive(Error, Debug)]
@@ -50,6 +53,15 @@ pub enum AuthError {
 
     #[error("Enable the cert-auth feature to use certificate authentication")]
     CertAuthNotEnabled,
+
+    #[error("Browser authentication timed out")]
+    BrowserAuthTimeout,
+
+    #[error("Failed to start local server: {0}")]
+    LocalServerError(String),
+
+    #[error("Failed to open browser: {0}")]
+    BrowserOpenError(String),
 }
 
 #[derive(Debug)]
@@ -105,6 +117,7 @@ impl AuthToken {
 enum AuthType {
     Certificate,
     Password,
+    ExternalBrowser,
 }
 
 /// Requests, caches, and renews authentication tokens.
@@ -208,6 +221,41 @@ impl Session {
         }
     }
 
+    /// Authenticate using external browser (SSO)
+    // fixme: add builder or introduce structs
+    #[allow(clippy::too_many_arguments)]
+    pub fn externalbrowser_auth(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+    ) -> Self {
+        let account_identifier = account_identifier.to_uppercase();
+
+        let database = database.map(str::to_uppercase);
+        let schema = schema.map(str::to_uppercase);
+
+        let username = username.to_uppercase();
+        let role = role.map(str::to_uppercase);
+
+        Self {
+            connection,
+            auth_tokens: Mutex::new(None),
+            auth_type: AuthType::ExternalBrowser,
+            account_identifier,
+            warehouse: warehouse.map(str::to_uppercase),
+            database,
+            username,
+            role,
+            password: None,
+            schema,
+            private_key_pem: None,
+        }
+    }
+
     /// Get cached token or request a new one if old one has expired.
     pub async fn get_token(&self) -> Result<AuthParts, AuthError> {
         let mut auth_tokens = self.auth_tokens.lock().await;
@@ -229,6 +277,10 @@ impl Session {
                 AuthType::Password => {
                     log::info!("Starting session with password authentication");
                     self.create(self.passwd_request_body()?).await
+                }
+                AuthType::ExternalBrowser => {
+                    log::info!("Starting session with external browser authentication");
+                    self.authenticate_with_browser().await
                 }
             }?;
             *auth_tokens = Some(tokens);
@@ -418,5 +470,170 @@ impl Session {
             )),
             _ => Err(AuthError::UnexpectedResponse),
         }
+    }
+
+    /// Main external browser authentication flow
+    async fn authenticate_with_browser(&self) -> Result<AuthTokens, AuthError> {
+        // Start local HTTP server to receive the callback
+        let (listener, port) = Self::start_callback_server()?;
+        log::info!("Local callback server started on port {}", port);
+
+        // Get the SSO URL and proof key from Snowflake
+        let (mut body, sso_url) = self.externalbrowser_request_body(port).await?;
+
+        // Open the browser with the SSO URL
+        log::info!("Opening browser for authentication: {}", sso_url);
+        webbrowser::open(&sso_url).map_err(|e| AuthError::BrowserOpenError(e.to_string()))?;
+
+        // Wait for the browser to redirect back with the token (5 minute timeout)
+        let timeout = Duration::from_secs(300);
+        let token = Self::receive_saml_token(listener, timeout)?;
+        log::debug!("Received SAML token from browser callback");
+
+        // Update the request body with the received token
+        body.data.token = token.clone();
+        log::debug!(
+            "Completing authentication with token (length: {})",
+            token.len()
+        );
+
+        // Complete the authentication with the token and proof key
+        self.create(body).await
+    }
+
+    /// Start a local HTTP server to receive the SAML token callback
+    /// Returns (listener, port number)
+    fn start_callback_server() -> Result<(TcpListener, u16), AuthError> {
+        // Bind to a random available port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        let port = listener
+            .local_addr()
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?
+            .port();
+
+        // Set read timeout for the listener
+        listener
+            .set_nonblocking(false)
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        Ok((listener, port))
+    }
+
+    /// Wait for the browser callback with the SAML token
+    fn receive_saml_token(listener: TcpListener, timeout: Duration) -> Result<String, AuthError> {
+        log::debug!("Waiting for browser callback...");
+
+        let (mut stream, _) = listener.accept().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+            {
+                AuthError::BrowserAuthTimeout
+            } else {
+                AuthError::LocalServerError(e.to_string())
+            }
+        })?;
+
+        // Set timeout on the stream
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        let buf_reader = BufReader::new(&stream);
+        let request_line = buf_reader
+            .lines()
+            .next()
+            .ok_or_else(|| AuthError::LocalServerError("Empty request".to_string()))?
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        log::debug!("Received request: {}", request_line);
+
+        // Parse the request line: GET /?token=... HTTP/1.1
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 2 || parts[0] != "GET" {
+            return Err(AuthError::LocalServerError(
+                "Invalid HTTP request".to_string(),
+            ));
+        }
+
+        let path = parts[1];
+        let token = if let Some(query_start) = path.find("?token=") {
+            let token_start = query_start + 7; // length of "?token="
+            let token_end = path[token_start..]
+                .find('&')
+                .map(|i| token_start + i)
+                .unwrap_or(path.len());
+            path[token_start..token_end].to_string()
+        } else {
+            return Err(AuthError::LocalServerError(
+                "Token not found in callback".to_string(),
+            ));
+        };
+
+        // Send success response to browser
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+            <html><body><h1>Authentication Successful</h1>\
+            <p>You can close this window and return to your application.</p>\
+            </body></html>";
+
+        stream
+            .write_all(response.as_bytes())
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+        stream
+            .flush()
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+
+        Ok(token)
+    }
+
+    async fn externalbrowser_request_body(
+        &self,
+        port: u16,
+    ) -> Result<(ExternalBrowserLoginRequest, String), AuthError> {
+        // First, request the SSO URL from Snowflake using the simple authenticator-request format
+        let auth_request = AuthenticatorRequest {
+            data: AuthenticatorRequestData {
+                account_name: self.account_identifier.clone(),
+                login_name: self.username.clone(),
+                authenticator: "EXTERNALBROWSER".to_string(),
+                browser_mode_redirect_port: port.to_string(),
+            },
+        };
+
+        // Make initial request to get SSO URL from /session/authenticator-request
+        let auth_resp = self
+            .connection
+            .request::<crate::responses::AuthenticatorResponse>(
+                QueryType::AuthenticatorRequest,
+                &self.account_identifier,
+                &[],
+                None,
+                &auth_request,
+            )
+            .await?;
+
+        log::debug!("Received SSO URL: {}", auth_resp.data.sso_url);
+        log::debug!("Using proof key from server: {}", auth_resp.data.proof_key);
+
+        if !auth_resp.success {
+            return Err(AuthError::AuthFailed(
+                auth_resp.code.unwrap_or_default(),
+                auth_resp.message.unwrap_or_default(),
+            ));
+        }
+
+        // Prepare the full login request body for the second step
+        // Use the proof key returned by Snowflake, not a generated one
+        let login_body = ExternalBrowserLoginRequest {
+            data: ExternalBrowserRequestData {
+                login_request_common: self.login_request_common(),
+                authenticator: "EXTERNALBROWSER".to_string(),
+                token: String::new(),
+                proof_key: auth_resp.data.proof_key,
+            },
+        };
+
+        Ok((login_body, auth_resp.data.sso_url))
     }
 }
