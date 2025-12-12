@@ -17,6 +17,7 @@ pub struct LoginRequest<T> {
 pub type PasswordLoginRequest = LoginRequest<PasswordRequestData>;
 #[cfg(feature = "cert-auth")]
 pub type CertLoginRequest = LoginRequest<CertRequestData>;
+pub type ExternalBrowserLoginRequest = LoginRequest<ExternalBrowserRequestData>;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -61,6 +62,27 @@ pub struct CertRequestData {
     pub authenticator: String,
     pub token: String,
 }
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct ExternalBrowserRequestData {
+    #[serde(flatten)]
+    pub login_request_common: LoginRequestCommon,
+    pub authenticator: String,
+    pub token: String,
+    pub proof_key: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct AuthenticatorRequestData {
+    pub account_name: String,
+    pub login_name: String,
+    pub authenticator: String,
+    pub browser_mode_redirect_port: String,
+}
+
+pub type AuthenticatorRequest = LoginRequest<AuthenticatorRequestData>;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
