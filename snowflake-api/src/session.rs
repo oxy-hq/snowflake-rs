@@ -63,6 +63,9 @@ pub enum AuthError {
     #[error("Browser authentication timed out")]
     BrowserAuthTimeout,
 
+    #[error("Failed to request SSO URL from Snowflake")]
+    SsoUrlCallbackError,
+
     #[error("Failed to start local server: {0}")]
     LocalServerError(String),
 
@@ -966,8 +969,6 @@ impl Session {
         // First, request the SSO URL from Snowflake using the simple authenticator-request format
         let auth_request = AuthenticatorRequest {
             data: AuthenticatorRequestData {
-                account_name: self.account_identifier.clone(),
-                login_name: self.username.clone(),
                 authenticator: "EXTERNALBROWSER".to_string(),
                 browser_mode_redirect_port: port.to_string(),
             },
@@ -983,7 +984,11 @@ impl Session {
                 None,
                 &auth_request,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                log::error!("Failed to request SSO URL: {}", e);
+                AuthError::SsoUrlCallbackError
+            })?;
 
         log::debug!("Received SSO URL: {}", auth_resp.data.sso_url);
         log::debug!("Using proof key from server: {}", auth_resp.data.proof_key);

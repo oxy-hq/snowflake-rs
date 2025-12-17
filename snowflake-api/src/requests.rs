@@ -76,8 +76,6 @@ pub struct ExternalBrowserRequestData {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct AuthenticatorRequestData {
-    pub account_name: String,
-    pub login_name: String,
     pub authenticator: String,
     pub browser_mode_redirect_port: String,
 }
