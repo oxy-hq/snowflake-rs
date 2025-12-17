@@ -1,5 +1,3 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,6 +6,8 @@ use futures::lock::Mutex;
 #[cfg(feature = "cert-auth")]
 use snowflake_jwt::generate_jwt_token;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// Callback type for receiving the SSO URL during external browser authentication.
 /// The callback receives the SSO URL as a String parameter.
@@ -832,7 +832,7 @@ impl Session {
     /// Main external browser authentication flow
     async fn authenticate_with_browser(&self) -> Result<AuthTokens, AuthError> {
         // Start local HTTP server to receive the callback
-        let (listener, port) = Self::start_callback_server()?;
+        let (listener, port) = Self::start_callback_server().await?;
         log::info!("Local callback server started on port {}", port);
 
         // Get the SSO URL and proof key from Snowflake
@@ -854,7 +854,7 @@ impl Session {
             "Waiting for browser callback with timeout of {} seconds",
             self.browser_auth_timeout_secs
         );
-        let token = Self::receive_saml_token(listener, timeout)?;
+        let token = Self::receive_saml_token(listener, timeout).await?;
         log::debug!("Received SAML token from browser callback");
 
         // Update the request body with the received token
@@ -870,9 +870,10 @@ impl Session {
 
     /// Start a local HTTP server to receive the SAML token callback
     /// Returns (listener, port number)
-    fn start_callback_server() -> Result<(TcpListener, u16), AuthError> {
+    async fn start_callback_server() -> Result<(TcpListener, u16), AuthError> {
         // Bind to a random available port
         let listener = TcpListener::bind("127.0.0.1:0")
+            .await
             .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
 
         let port = listener
@@ -884,54 +885,37 @@ impl Session {
     }
 
     /// Wait for the browser callback with the SAML token
-    fn receive_saml_token(listener: TcpListener, timeout: Duration) -> Result<String, AuthError> {
+    async fn receive_saml_token(
+        listener: TcpListener,
+        timeout: Duration,
+    ) -> Result<String, AuthError> {
         log::debug!(
             "Waiting for browser callback with timeout of {} seconds...",
             timeout.as_secs()
         );
 
-        // Set listener to non-blocking mode so we can implement timeout
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
-
-        let start_time = Instant::now();
-
-        // Poll for incoming connection with timeout
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(conn) => break conn,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Check if we've exceeded timeout
-                    if start_time.elapsed() >= timeout {
-                        log::warn!(
-                            "Browser authentication timed out after {} seconds",
-                            timeout.as_secs()
-                        );
-                        return Err(AuthError::BrowserAuthTimeout);
-                    }
-                    // Sleep briefly before trying again to avoid busy-waiting
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => {
-                    return Err(AuthError::LocalServerError(e.to_string()));
-                }
+        // Poll for incoming connection with timeout using tokio::select!
+        let (mut stream, _) = tokio::select! {
+            result = listener.accept() => {
+                result.map_err(|e| AuthError::LocalServerError(e.to_string()))?
+            },
+            _ = tokio::time::sleep(timeout) => {
+                log::warn!(
+                    "Browser authentication timed out after {} seconds",
+                    timeout.as_secs()
+                );
+                return Err(AuthError::BrowserAuthTimeout);
             }
         };
 
         log::debug!("Browser callback received");
-
-        // Set timeout on the stream for reading the request
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
-
-        let buf_reader = BufReader::new(&stream);
+        let buf_reader = tokio::io::BufReader::new(&mut stream);
         let request_line = buf_reader
             .lines()
-            .next()
-            .ok_or_else(|| AuthError::LocalServerError("Empty request".to_string()))?
-            .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
+            .next_line()
+            .await
+            .map_err(|e| AuthError::LocalServerError(e.to_string()))?
+            .ok_or_else(|| AuthError::LocalServerError("Empty request".to_string()))?;
 
         log::debug!("Received request: {}", request_line);
 
@@ -965,9 +949,11 @@ impl Session {
 
         stream
             .write_all(response.as_bytes())
+            .await
             .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
         stream
             .flush()
+            .await
             .map_err(|e| AuthError::LocalServerError(e.to_string()))?;
 
         Ok(token)
