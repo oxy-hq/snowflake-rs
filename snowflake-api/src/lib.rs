@@ -46,6 +46,9 @@ mod responses;
 mod session;
 mod token_cache;
 
+// Re-export commonly used types
+pub use session::SsoUrlCallback;
+
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
     #[error(transparent)]
@@ -244,6 +247,8 @@ pub struct SnowflakeApiBuilder {
     cache_directory: Option<PathBuf>,
     /// Timeout for external browser authentication in seconds (default: 300)
     browser_auth_timeout_secs: u64,
+    /// Optional callback to receive the SSO URL during external browser authentication
+    sso_url_callback: Option<SsoUrlCallback>,
 }
 
 impl SnowflakeApiBuilder {
@@ -254,6 +259,7 @@ impl SnowflakeApiBuilder {
             enable_token_cache: false,
             cache_directory: None,
             browser_auth_timeout_secs: 300,
+            sso_url_callback: None,
         }
     }
 
@@ -281,6 +287,14 @@ impl SnowflakeApiBuilder {
     /// Default is 300 seconds (5 minutes).
     pub fn with_browser_timeout(mut self, timeout_secs: u64) -> Self {
         self.browser_auth_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Set a callback to receive the SSO URL during external browser authentication.
+    /// The callback receives the SSO URL as a String parameter.
+    /// This is useful for displaying the URL to the user or logging it.
+    pub fn with_sso_url_callback(mut self, callback: SsoUrlCallback) -> Self {
+        self.sso_url_callback = Some(callback);
         self
     }
 
@@ -322,6 +336,7 @@ impl SnowflakeApiBuilder {
                 self.browser_auth_timeout_secs,
                 self.enable_token_cache,
                 self.cache_directory,
+                self.sso_url_callback,
             ),
         };
 
@@ -456,11 +471,13 @@ impl SnowflakeApi {
     /// - `browser_auth_timeout_secs`: Browser authentication timeout in seconds (default: 300)
     /// - `enable_token_cache`: Enable filesystem token caching (default: false, WARNING: security implications)
     /// - `cache_directory`: Optional custom cache directory (uses platform default if None)
+    /// - `sso_url_callback`: Optional callback to receive the SSO URL
     ///
     /// # Example
     /// ```no_run
     /// use snowflake_api::SnowflakeApi;
     /// use std::path::PathBuf;
+    /// use std::sync::Arc;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let api = SnowflakeApi::with_externalbrowser_auth_full(
@@ -473,6 +490,7 @@ impl SnowflakeApi {
     ///     600,  // 10 minute timeout
     ///     true,  // enable token caching
     ///     Some(PathBuf::from("/custom/cache/dir")),  // custom cache directory
+    ///     Some(Arc::new(|url| println!("SSO URL: {}", url))),  // callback to receive SSO URL
     /// )?;
     ///
     /// // Authenticate immediately
@@ -491,6 +509,7 @@ impl SnowflakeApi {
         browser_auth_timeout_secs: u64,
         enable_token_cache: bool,
         cache_directory: Option<PathBuf>,
+        sso_url_callback: Option<SsoUrlCallback>,
     ) -> Result<Self, SnowflakeApiError> {
         let connection = Arc::new(Connection::new()?);
 
@@ -505,6 +524,7 @@ impl SnowflakeApi {
             browser_auth_timeout_secs,
             enable_token_cache,
             cache_directory,
+            sso_url_callback,
         );
 
         let account_identifier = account_identifier.to_uppercase();
