@@ -9,6 +9,10 @@ use futures::lock::Mutex;
 use snowflake_jwt::generate_jwt_token;
 use thiserror::Error;
 
+/// Callback type for receiving the SSO URL during external browser authentication.
+/// The callback receives the SSO URL as a String parameter.
+pub type SsoUrlCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 use crate::connection;
 use crate::connection::{Connection, QueryType};
 use crate::requests::{
@@ -216,6 +220,9 @@ pub struct Session {
 
     /// Token cache instance (created on-demand)
     token_cache: Option<TokenCache>,
+
+    /// Optional callback to receive the SSO URL during external browser authentication
+    sso_url_callback: Option<SsoUrlCallback>,
 }
 
 // todo: make builder
@@ -259,6 +266,7 @@ impl Session {
             enable_token_cache: false,
             cache_directory: None,
             token_cache: None,
+            sso_url_callback: None,
         }
     }
 
@@ -300,6 +308,7 @@ impl Session {
             enable_token_cache: false,
             cache_directory: None,
             token_cache: None,
+            sso_url_callback: None,
         }
     }
 
@@ -378,6 +387,7 @@ impl Session {
             browser_auth_timeout_secs,
             enable_token_cache,
             None,
+            None,
         )
     }
 
@@ -395,6 +405,7 @@ impl Session {
         browser_auth_timeout_secs: u64,
         enable_token_cache: bool,
         cache_directory: Option<PathBuf>,
+        sso_url_callback: Option<SsoUrlCallback>,
     ) -> Self {
         let account_identifier = account_identifier.to_uppercase();
 
@@ -442,6 +453,7 @@ impl Session {
             enable_token_cache,
             cache_directory,
             token_cache,
+            sso_url_callback,
         }
     }
 
@@ -825,6 +837,12 @@ impl Session {
 
         // Get the SSO URL and proof key from Snowflake
         let (mut body, sso_url) = self.externalbrowser_request_body(port).await?;
+
+        // Call the SSO URL callback if provided
+        if let Some(ref callback) = self.sso_url_callback {
+            log::debug!("Invoking SSO URL callback");
+            callback(sso_url.clone());
+        }
 
         // Open the browser with the SSO URL
         log::info!("Opening browser for authentication: {}", sso_url);

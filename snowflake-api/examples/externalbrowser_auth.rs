@@ -1,6 +1,7 @@
 extern crate snowflake_api;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::util::pretty::pretty_format_batches;
@@ -58,6 +59,12 @@ async fn main() -> Result<()> {
     println!("Initiating external browser authentication...");
     println!("A browser window will open for you to authenticate.");
 
+    // Create a callback to receive and display the SSO URL
+    let sso_callback = Arc::new(|url: String| {
+        println!("SSO URL received: {}", url);
+        println!("If the browser doesn't open automatically, use the URL above.");
+    });
+
     let mut api = SnowflakeApi::with_externalbrowser_auth_full(
         &args.account_identifier,
         args.warehouse.as_deref(),
@@ -68,6 +75,7 @@ async fn main() -> Result<()> {
         args.browser_timeout_secs.unwrap_or(30),
         args.enable_token_cache.unwrap_or(true),
         args.cache_directory,
+        Some(sso_callback),
     )?;
     println!("Authenticating...");
     api.authenticate().await?;
